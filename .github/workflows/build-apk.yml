@@ -175,6 +175,45 @@ jobs:
           } >> android/local.properties
           echo "sdk.dir=$ANDROID_HOME" >> android/local.properties
 
+      - name: Prefetch Gradle distribution
+        continue-on-error: true
+        run: |
+          set -u
+          PROP=android/gradle/wrapper/gradle-wrapper.properties
+          URL=$(grep '^distributionUrl=' "$PROP" | sed 's/^distributionUrl=//; s/\\//g')
+          echo "发行包: $URL"
+          NAME=$(basename "$URL" .zip)
+          # Gradle Wrapper 的缓存目录哈希 = base36(MD5(distributionUrl))
+          HASH=$(python3 -c "import hashlib,sys;d='0123456789abcdefghijklmnopqrstuvwxyz';f=lambda n:'' if n==0 else f(n//36)+d[n%36];print(f(int(hashlib.md5(sys.argv[1].encode()).hexdigest(),16)))" "$URL")
+          DEST="${GRADLE_USER_HOME:-$HOME/.gradle}/wrapper/dists/$NAME/$HASH"
+          mkdir -p "$DEST"
+          echo "缓存目录: $DEST"
+          if [ -s "$DEST/$NAME.zip" ] && unzip -tq "$DEST/$NAME.zip" >/dev/null 2>&1; then
+            echo "已存在完整缓存，跳过预下载"
+            exit 0
+          fi
+          # Wrapper 遇到 504 不会重试，这里用 curl 断点续传兜住，并带国内镜像兜底
+          for u in "$URL" \
+                   "https://mirrors.cloud.tencent.com/gradle/$NAME.zip" \
+                   "https://mirrors.huaweicloud.com/gradle/$NAME.zip"; do
+            echo "尝试源: $u"
+            for i in 1 2 3; do
+              if curl -fL --connect-timeout 30 --retry 4 --retry-all-errors \
+                   --retry-delay 10 -C - -o "$DEST/$NAME.zip" "$u"; then
+                if unzip -tq "$DEST/$NAME.zip" >/dev/null 2>&1; then
+                  echo "预下载成功（完整性校验通过）"
+                  exit 0
+                fi
+                echo "文件不完整，删除后重试"
+                rm -f "$DEST/$NAME.zip"
+              fi
+              echo "第 $i 次失败，15 秒后重试"
+              sleep 15
+            done
+          done
+          rm -f "$DEST/$NAME.zip"
+          echo "::warning::Gradle 发行包预下载失败，构建阶段将自行下载"
+
       - name: Build APK
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
