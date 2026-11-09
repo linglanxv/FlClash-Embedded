@@ -1,0 +1,7 @@
+# 一行一个，按顺序优先；前面的源不可用时会自动回退到下一个
+# 1) jsDelivr CDN（国内一般可直连）
+https://cdn.jsdelivr.net/gh/chengaopan/AutoMergePublicNodes@master/list.meta.yml
+# 2) GitHub raw 原始地址
+https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.meta.yml
+# 3) 备用：非 meta 版清单（mihomo 内核同样可解析）
+https://cdn.jsdelivr.net/gh/chengaopan/AutoMergePublicNodes@master/list.yml

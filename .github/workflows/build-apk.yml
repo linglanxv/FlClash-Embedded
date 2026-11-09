@@ -1,0 +1,236 @@
+name: Build FlClash (embedded subscription)
+
+# 说明：
+# - 手动触发 / push 到 main：总是构建最新（或指定）FlClash 版本
+# - 每日定时：仅当上游 FlClash 发布了新版本且本仓库尚未构建过时才构建
+# - 产物：arm64-v8a APK（可在手动触发时选择 all 构建全架构）
+# - 构建完成后自动创建 Release：embedded-<上游tag>
+
+on:
+  workflow_dispatch:
+    inputs:
+      flclash_tag:
+        description: 'FlClash 版本 tag（留空 = 最新 release）'
+        required: false
+        default: ''
+      flutter_version:
+        description: 'Flutter 版本（上游 CI 使用 3.47.6）'
+        required: false
+        default: '3.47.6'
+      arch:
+        description: 'APK 架构'
+        required: false
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - all
+      force_refresh:
+        description: '每次启动都强制重新下载订阅（false = 只用应用内自动更新周期）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+  schedule:
+    - cron: '0 20 * * *' # 每天 UTC 20:00（北京时间次日 4:00）检查上游新版本
+  push:
+    branches: [main, master]
+    paths:
+      - 'patch/**'
+      - 'subscription_url.txt'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLCLASH_REPO: chen08209/FlClash
+  DEFAULT_FLUTTER_VERSION: '3.47.6'
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve FlClash version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if [ -n "${{ github.event.inputs.flclash_tag }}" ]; then
+            TAG="${{ github.event.inputs.flclash_tag }}"
+          else
+            TAG=$(curl -sfL "https://api.github.com/repos/${FLCLASH_REPO}/releases/latest" | jq -r '.tag_name')
+            [ "$TAG" != "null" ] && [ -n "$TAG" ] || { echo "获取上游最新版本失败"; exit 1; }
+          fi
+          echo "上游版本: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          SHOULD_BUILD=true
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if gh release view "embedded-$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$TAG 已构建发布过，跳过"
+              SHOULD_BUILD=false
+            fi
+          fi
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+
+  build:
+    if: needs.resolve.outputs.should_build == 'true'
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout FlClash source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FLCLASH_REPO }}
+          ref: ${{ needs.resolve.outputs.tag }}
+          submodules: recursive
+
+      - name: Checkout build config (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ github.event.inputs.flutter_version || env.DEFAULT_FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r28c
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Apply embedded subscription patch
+        run: |
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force_refresh }}" = "true" ]; then
+            FORCE_FLAG="--force-refresh"
+          fi
+          python3 ci/patch/embed_subscription.py \
+            --url-file ci/subscription_url.txt \
+            --label "AutoMergePublicNodes" \
+            --api-file lib/providers/actions/profiles.dart \
+            $FORCE_FLAG
+          git --no-pager diff --stat
+          git --no-pager diff -- lib/bootstrap.dart | head -160
+
+      - name: Embed CA bundle (best effort)
+        run: |
+          CA_BUNDLE=cacert-2026-09-25.pem
+          if wget -q "https://curl.se/ca/$CA_BUNDLE" -O core/Clash.Meta/component/ca/ca-certificates.crt; then
+            echo "CA bundle 已内嵌"
+          else
+            echo "::warning::下载 CA bundle 失败，跳过（不影响构建）"
+          fi
+
+      - name: Prepare signing
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p android/app
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > android/app/keystore.jks
+            echo "使用 secrets 中配置的 keystore"
+          else
+            echo "::warning::未配置 KEYSTORE_BASE64 等 secrets，本次使用临时生成的 keystore；以后如需覆盖安装升级，请固定同一个 keystore（见仓库说明）"
+            keytool -genkeypair -v -keystore android/app/keystore.jks \
+              -storepass flclash123 -keypass flclash123 -alias flclash \
+              -keyalg RSA -keysize 2048 -validity 36500 \
+              -dname "CN=FlClash Embedded, OU=Personal, O=Personal, L=NA, ST=NA, C=CN"
+          fi
+          {
+            echo "keyAlias=${KEY_ALIAS:-flclash}"
+            echo "storePassword=${STORE_PASSWORD:-flclash123}"
+            echo "keyPassword=${KEY_PASSWORD:-flclash123}"
+          } >> android/local.properties
+          echo "sdk.dir=$ANDROID_HOME" >> android/local.properties
+
+      - name: Build APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          flutter --version
+          flutter pub get
+          ARCH="${{ inputs.arch || 'arm64' }}"
+          if [ "$ARCH" = "all" ]; then
+            dart setup.dart android --env stable -v
+          else
+            dart setup.dart android --arch arm64 --env stable -v
+          fi
+          echo "---- 产物 ----"
+          find dist -type f | sort
+          # flutter_distributor 可能输出到 dist/<版本>/ 子目录，统一收集到 out/
+          mkdir -p out
+          find dist -name '*.apk' -type f -exec cp {} out/ \;
+          ls -l out
+          [ -n "$(ls -A out)" ] || { echo "没有找到 APK 产物"; exit 1; }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ needs.resolve.outputs.tag }}
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -e
+          TAG="embedded-$UPSTREAM_TAG"
+          (cd out && sha256sum ./*.apk > SHA256SUMS.txt)
+          NOTES=$(cat <<'EOF'
+          ### FlClash 内嵌订阅版
+
+          - 基于上游 FlClash `%UPSTREAM_TAG%` 自动云编译
+          - 已内嵌订阅：AutoMergePublicNodes（`list.meta.yml`），首次启动自动导入
+          - 多源自动回退：主源不可用自动切换备用源（jsDelivr / GitHub raw / list.yml）
+          - 启动时同步订阅地址：订阅源变更后重新编译，旧配置地址会自动覆盖并重新拉取
+          - 订阅随应用自动更新，无需每天手动刷新
+          - 手机一般下载 `app-arm64-v8a-release.apk`
+
+          > 注意：与官方版签名不同，覆盖安装会失败，需先卸载官方版再安装（订阅数据会清空）。
+          EOF
+          )
+          NOTES="${NOTES//\%UPSTREAM_TAG\%/$UPSTREAM_TAG}"
+          echo "$NOTES" > release.md
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/*.apk out/SHA256SUMS.txt --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" out/*.apk out/SHA256SUMS.txt \
+              -R "$GITHUB_REPOSITORY" \
+              --title "FlClash $UPSTREAM_TAG（内嵌订阅版）" \
+              --notes-file release.md
+          fi
