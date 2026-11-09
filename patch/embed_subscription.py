@@ -11,6 +11,9 @@
    自动回退到可用源，避免单一 CDN 不可用导致导入失败。
 4) --force-refresh 打开后，每次启动都强制重新下载一次订阅内容。
 
+注入方式：把方法插入 AppBootstrap 类内部（这样能访问类的私有字段
+_container），常量追加到文件末尾（顶层），并在 _initApp() 里调用。
+
 脚本幂等：重复运行不会重复注入。
 注入点基于正则锚点匹配，并有降级锚点；全部失败时报错退出（不静默）。
 """
@@ -18,16 +21,21 @@ import argparse
 import pathlib
 import re
 import sys
+import textwrap
 
-FUNC_TEMPLATE = '''
-
+# 顶层常量（追加到文件末尾）
+CONST_TEMPLATE = '''
 // ==== [embedded-subscription] auto-generated, DO NOT EDIT ====
 const String kEmbeddedSubscriptionLabel = '__LABEL__';
 const bool kEmbeddedForceRefreshOnLaunch = __FORCE__;
 const List<String> kEmbeddedSubscriptionUrls = <String>[
 __URL_LIST__
 ];
+// ==== [/embedded-subscription] ====
+'''
 
+# 类内方法（插入到 AppBootstrap 里 _initApp 之前），基准缩进 0，脚本会整体缩进
+METHOD_TEMPLATE = '''
 Future<bool> _probeEmbeddedUrl(String url) async {
   try {
     final client = HttpClient()
@@ -113,12 +121,14 @@ Future<void> _initEmbeddedProfile() async {
     }
   }
 }
-// ==== [/embedded-subscription] ====
 '''
 
 CALL_LINE = 'unawaited(_initEmbeddedProfile());'
 
-# 主锚点：bootstrap.dart _initApp() 中的订阅自动更新调用语句
+# _initApp 的方法声明（用于把方法插到它前面，保持类成员身份）
+INIT_APP_DECL = re.compile(r'(?m)^([ \t]*)Future<void> _initApp\(')
+
+# 主锚点：_initApp() 中的订阅自动更新调用语句
 PRIMARY_ANCHOR = re.compile(
     r'unawaited\(\s*_container\.read\(profilesActionProvider\.notifier\)'
     r'\.autoUpdateProfiles\(\)\s*,?\s*\);'
@@ -130,7 +140,7 @@ FALLBACK_ANCHOR = re.compile(
 )
 
 # 注入代码依赖的上游 API/符号
-REQUIRED_BOOTSTRAP = ('profilesActionProvider', 'profilesDao', 'appPath')
+REQUIRED_BOOTSTRAP = ('_container', 'profilesActionProvider', 'profilesDao', 'appPath')
 REQUIRED_ACTIONS = ('void putProfile(', 'updateProfile(')
 REQUIRED_MODEL = 'factory Profile.normal('
 
@@ -198,48 +208,60 @@ def main() -> int:
         print('[embedded-subscription] already injected, skip')
         return 0
 
-    url_list = '\n'.join("  '%s'," % u for u in urls)
-    func_code = (FUNC_TEMPLATE
-                 .replace('__URL_LIST__', url_list)
-                 .replace('__LABEL__', args.label)
-                 .replace('__FORCE__', 'true' if args.force_refresh else 'false'))
+    # 1. 把方法插入类内部（缩进对齐 _initApp 的成员缩进），否则访问不到 _container
+    decl = INIT_APP_DECL.search(src)
+    if not decl:
+        print('ERROR: _initApp declaration not found in %s' % target, file=sys.stderr)
+        return 1
+    indent = decl.group(1)
+    if not indent:
+        print('ERROR: _initApp is not indented as a class member, abort', file=sys.stderr)
+        return 1
+    methods = textwrap.indent(METHOD_TEMPLATE.strip('\n'), indent)
+    src = src[:decl.start()] + methods + '\n\n' + src[decl.start():]
 
-    inserted = False
+    # 2. 在 _initApp 里调用（优先跟在 autoUpdateProfiles() 之后）
     m = PRIMARY_ANCHOR.search(src)
     if m:
         line_start = src.rfind('\n', 0, m.start()) + 1
-        indent = re.match(r'[ \t]*', src[line_start:]).group(0)
-        src = src[:m.end()] + '\n' + indent + CALL_LINE + src[m.end():]
-        inserted = True
+        call_indent = re.match(r'[ \t]*', src[line_start:]).group(0)
+        src = src[:m.end()] + '\n' + call_indent + CALL_LINE + src[m.end():]
         print('[embedded-subscription] call inserted after autoUpdateProfiles()')
     else:
         m = FALLBACK_ANCHOR.search(src)
-        if m:
-            line_start = src.rfind('\n', 0, m.start()) + 1
-            indent = re.match(r'[ \t]*', src[line_start:]).group(0) + '  '
-            src = src[:m.end()] + '\n' + indent + CALL_LINE + src[m.end():]
-            inserted = True
-            print('[embedded-subscription] call inserted at _initApp() entry (fallback anchor)')
+        if not m:
+            print('ERROR: no insertion anchor found in %s; please review upstream changes.'
+                  % target, file=sys.stderr)
+            return 1
+        src = src[:m.end()] + '\n' + indent + '  ' + CALL_LINE + src[m.end():]
+        print('[embedded-subscription] call inserted at _initApp() entry (fallback anchor)')
 
-    if not inserted:
-        print('ERROR: no insertion anchor found in %s; please review upstream changes.' % target,
-              file=sys.stderr)
-        return 1
-
-    src = src.rstrip('\n') + '\n' + func_code
+    # 3. 常量追加到文件末尾（顶层）
+    consts = (CONST_TEMPLATE
+              .replace('__URL_LIST__', '\n'.join("  '%s'," % u for u in urls))
+              .replace('__LABEL__', args.label)
+              .replace('__FORCE__', 'true' if args.force_refresh else 'false'))
+    src = src.rstrip('\n') + '\n' + consts
     target.write_text(src, encoding='utf-8')
 
     # 自检
     final = target.read_text(encoding='utf-8')
-    ok = ('kEmbeddedSubscriptionUrls' in final
-          and '_initEmbeddedProfile' in final
-          and all(u in final for u in urls))
-    if not ok:
-        print('ERROR: self-check failed after injection', file=sys.stderr)
+    checks = {
+        'kEmbeddedSubscriptionUrls': 'kEmbeddedSubscriptionUrls' in final,
+        '_initEmbeddedProfile': '_initEmbeddedProfile' in final,
+        'call line': CALL_LINE in final,
+        'all urls': all(u in final for u in urls),
+        'method indented': re.search(re.escape(indent) + r'Future<void> _initEmbeddedProfile\(\)', final) is not None,
+    }
+    bad = [k for k, v in checks.items() if not v]
+    if bad:
+        print('ERROR: self-check failed: %s' % ', '.join(bad), file=sys.stderr)
         return 1
+
     print('[embedded-subscription] injected OK -> %s' % target)
     print('  label        : %s' % args.label)
     print('  force refresh: %s' % ('true' if args.force_refresh else 'false'))
+    print('  member indent: %d spaces' % len(indent))
     for i, u in enumerate(urls, 1):
         print('  source %-5d: %s' % (i, u))
     return 0
