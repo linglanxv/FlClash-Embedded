@@ -178,15 +178,39 @@ jobs:
       - name: Build APK
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          # Gradle 拉 Maven 依赖偶发 504，放宽重试次数与超时
+          GRADLE_OPTS: >-
+            -Dorg.gradle.internal.repository.max.retries=8
+            -Dorg.gradle.internal.http.connectionTimeout=120000
+            -Dorg.gradle.internal.http.socketTimeout=120000
         run: |
           flutter --version
-          flutter pub get
           ARCH="${{ inputs.arch || 'arm64' }}"
-          if [ "$ARCH" = "all" ]; then
-            dart setup.dart android --env stable -v
-          else
-            dart setup.dart android --arch arm64 --env stable -v
-          fi
+
+          build() {
+            flutter pub get
+            if [ "$ARCH" = "all" ]; then
+              dart setup.dart android --env stable -v
+            else
+              dart setup.dart android --arch arm64 --env stable -v
+            fi
+          }
+
+          for i in 1 2 3; do
+            echo "::group::build attempt $i"
+            if build; then
+              echo "::endgroup::"
+              echo "构建成功（第 $i 次尝试）"
+              break
+            fi
+            echo "::endgroup::"
+            if [ "$i" = "3" ]; then
+              echo "::error::连续 3 次构建失败"
+              exit 1
+            fi
+            echo "::warning::第 $i 次构建失败（多为上游依赖下载超时），60 秒后重试"
+            sleep 60
+          done
           echo "---- 产物 ----"
           find dist -type f | sort
           # flutter_distributor 可能输出到 dist/<版本>/ 子目录，统一收集到 out/
